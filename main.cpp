@@ -1,113 +1,195 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
 
+namespace {
 
-int main() {
-    //Load a stereo image pair
+// Calibration values needed to build the Q reprojection matrix, parsed at
+// runtime from a sequence's calib.txt rather than hardcoded — different
+// KITTI sequences (and definitely different datasets) have different
+// focal lengths/baselines.
+struct StereoCalibration {
+    double focal_length;
+    double cx;
+    double cy;
+    double cx_right;
+    double tx;  // signed baseline in meters (focal length already divided out)
+};
 
-    cv::Mat left = cv::imread("0left.png", cv::IMREAD_GRAYSCALE);
-    cv::Mat right = cv::imread("0right.png", cv::IMREAD_GRAYSCALE);
+// calib.txt lines look like "P0: v0 v1 v2 ... v11" - a label token followed
+// by the 12 values of a row-major flattened 3x4 projection matrix. This pulls
+// out just the 12 numbers so callers can index into them.
+std::vector<double> parseCalibLine(const std::string& line) {
+    std::istringstream stream(line);
+    std::string label;
+    stream >> label;  // discard "P0:" / "P1:" etc.
 
-    if (left.empty() || right.empty())
-    {
-        std::cerr << "ERROR: Could not load images" << std::endl;
-        return -1;
+    std::vector<double> values;
+    double value;
+    while (stream >> value) {
+        values.push_back(value);
     }
-        
+    return values;
+}
 
-    //for each frame pair (left_img, right_img)
-    //1. compute disparity
+// Reads P0 (left/image_0) and P1 (right/image_1) from calib.txt. In each
+// flattened 3x4 P matrix: index 0 = focal length, index 2 = cx, index 6 = cy,
+// index 3 = Tx. KITTI bakes focal length into Tx (Tx = -focal_length *
+// baseline_meters), so it's divided back out here - the same fix already
+// verified against buildReprojectionMatrix()'s expectations.
+StereoCalibration loadCalibration(const std::string& calib_path) {
+    std::ifstream file(calib_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Could not open calib.txt at: " + calib_path);
+    }
 
-    cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(
-        0,      // minDisparity
-        96,     //numDisparities (must be divisible by 16)
-        11,     // blockSize (odd number, typically 5-11)
-        8  * 3 * 11 * 11, //P1 smoothness penalty
-        32 * 3 * 11 * 11, //P2 smoothness penalty
-        1,      // disp12MaxDiff
-        4,      //preFilterCap
-        10,     //uniquenessRatio
-        100,    //speckeWindowSize
-        32     //speckelRange
-    );
-
-    cv::Mat disparity_raw, disparity_float;
-    sgbm->compute(left, right, disparity_raw);
-    disparity_raw.convertTo(disparity_float, CV_32F, 1.0 / 16.0);
-    
-
-    double f    =  7.215377e+02;
-    double cx   =  6.095593e+02;
-    double cy   =  1.728540e+02;
-    double Tx   = -3.875744e+02;  // P_rect_01[0][3] — already f*baseline in pixel units
-    double cx_r =  6.095593e+02;  // cx of right camera (same here since rectified)
-
-    cv::Mat Q = (cv::Mat_<double>(4, 4) <<
-        1,  0,  0,       -cx,
-        0,  1,  0,       -cy,
-        0,  0,  0,        f,
-        0,  0, -1.0/Tx,  (cx - cx_r) / Tx
-    );
-    // (cx - cx') / Tx — zero here since cx == cx_r
-    //
-    cv::Mat points3D;
-    cv::reprojectImageTo3D(disparity_float, points3D, Q, true);
-
-    //print sample 3d point to verify
-
-    // int cxt = left.cols / 2;
-    // int cyt = left.rows / 2;
-    // cv::Vec3f pt = points3D.at<cv::Vec3f>(cyt, cxt);
-
-    // std::cout << "Center pixel point:" << std::endl;
-    // std::cout << "  X = " << pt[0] << " m" << std::endl;
-    // std::cout << "  Y = " << pt[1] << " m" << std::endl;
-    // std::cout << "  Z = " << pt[2] << " m" << std::endl;
-
-    // if(pt[2] > 9999.0f) {
-    //     std::cout << "  invalid disparity at this pixel" << std::endl;
-    // }
-
-    bool found = false;
-    for (int row = 0; row < points3D.rows && !found; row++) {
-        for (int col = 0; col < points3D.cols && !found; col++) {
-            cv::Vec3f pt = points3D.at<cv::Vec3f>(row, col);
-            // Valid point: Z is positive, finite, and under 100m
-            if (pt[2] > 0 && pt[2] < 100.0f) {
-                std::cout << "Valid pixel at (" << col << ", " << row << ")" << std::endl;
-                std::cout << "  X = " << pt[0] << " m" << std::endl;
-                std::cout << "  Y = " << pt[1] << " m" << std::endl;
-                std::cout << "  Z = " << pt[2] << " m" << std::endl;
-                found = true;
-            }
+    std::vector<double> p0;
+    std::vector<double> p1;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.rfind("P0:", 0) == 0) {
+            p0 = parseCalibLine(line);
+        } else if (line.rfind("P1:", 0) == 0) {
+            p1 = parseCalibLine(line);
         }
     }
 
-    if (!found) {
-        std::cout << "No valid 3D points found — check image loading or Q matrix" << std::endl;
+    constexpr size_t kExpectedValues = 12;
+    if (p0.size() != kExpectedValues || p1.size() != kExpectedValues) {
+        throw std::runtime_error("calib.txt missing P0/P1 or malformed");
     }
 
-
-    //2. Detect + match features 
-    //orb->detectAndCompute(left, keypoints, descriptors)
-    //matcher->match(desc_prev, desc_curr, matches)
-
-    //3. Build 3D-2D correspondences
-    // for each match: prev 3d point -> curr2d point
-
-    //4. solve pose
-    //solvePnPRansac(pts3D,pts2Dk,K,dist,rvec,tvec)
-
-    //5. Compose + print
-    //T_world = T_world * deltaT
-    //cout << T_world.translation() << endl
+    StereoCalibration calib;
+    calib.focal_length = p0[0];
+    calib.cx = p0[2];
+    calib.cy = p0[6];
+    calib.cx_right = p1[2];
+    calib.tx = p1[3] / calib.focal_length;
+    return calib;
 }
 
+constexpr int kFrameNumberWidth = 6;
 
-// int main(){
-//     std::cout << "OpenCV version: " << CV_VERSION << std::endl;
-//     cv::Mat img = cv::Mat::zeros(100,100, CV_8UC1);
-//     std::cout << "Mat created: " << img.rows << "x" << img.cols << std::endl;
-//     return 0;
-// }
+// Builds paths like "<sequence_dir>/image_0/000000.png".
+std::string frameImagePath(const std::string& sequence_dir,
+                            const std::string& camera_folder,
+                            int frame_index) {
+    std::ostringstream path;
+    path << sequence_dir << "/" << camera_folder << "/"
+         << std::setw(kFrameNumberWidth) << std::setfill('0') << frame_index
+         << ".png";
+    return path.str();
+}
+
+// StereoSGBM tuning parameters (see cv::StereoSGBM::create docs for meaning).
+constexpr int kMinDisparity = 0;
+constexpr int kNumDisparities = 96;   // must be divisible by 16
+constexpr int kBlockSize = 11;        // odd, typically 5-11
+constexpr int kDisp12MaxDiff = 1;
+constexpr int kPreFilterCap = 4;
+constexpr int kUniquenessRatio = 10;
+constexpr int kSpeckleWindowSize = 100;
+constexpr int kSpeckleRange = 32;
+
+constexpr float kMaxValidDepthMeters = 100.0f;
+
+cv::Mat computeDisparity(const cv::Mat& left, const cv::Mat& right) {
+    const cv::Ptr<cv::StereoSGBM> sgbm = cv::StereoSGBM::create(
+        kMinDisparity,
+        kNumDisparities,
+        kBlockSize,
+        8 * 3 * kBlockSize * kBlockSize,   // P1 smoothness penalty
+        32 * 3 * kBlockSize * kBlockSize,  // P2 smoothness penalty
+        kDisp12MaxDiff,
+        kPreFilterCap,
+        kUniquenessRatio,
+        kSpeckleWindowSize,
+        kSpeckleRange
+    );
+
+    cv::Mat disparity_raw;
+    sgbm->compute(left, right, disparity_raw);
+
+    // SGBM returns fixed-point disparity (16x scale); convert to real disparity values.
+    cv::Mat disparity_float;
+    disparity_raw.convertTo(disparity_float, CV_32F, 1.0 / 16.0);
+    return disparity_float;
+}
+
+cv::Mat buildReprojectionMatrix(const StereoCalibration& calib) {
+    // OpenCV's Q-matrix convention wants the signed baseline (-baseline_meters)
+    // in the bottom-left slot, not focal_length * baseline. calib.tx already
+    // has focal length divided back out by loadCalibration(). Skipping that
+    // step silently inflates every depth by ~f (a 5m-deep scene comes out as
+    // ~3600m) — verified by a scratch diagnostic build before this fix landed.
+    return (cv::Mat_<double>(4, 4) <<
+        1, 0, 0, -calib.cx,
+        0, 1, 0, -calib.cy,
+        0, 0, 0, calib.focal_length,
+        0, 0, -1.0 / calib.tx, (calib.cx - calib.cx_right) / calib.tx
+    );
+}
+
+cv::Mat disparityToPointCloud(const cv::Mat& disparity_float,
+                               const StereoCalibration& calib) {
+    const cv::Mat Q = buildReprojectionMatrix(calib);
+    cv::Mat points_3d;
+    cv::reprojectImageTo3D(disparity_float, points_3d, Q, true);
+    return points_3d;
+}
+
+void printFirstValidPoint(const cv::Mat& points_3d) {
+    for (int row = 0; row < points_3d.rows; ++row) {
+        for (int col = 0; col < points_3d.cols; ++col) {
+            const cv::Vec3f point = points_3d.at<cv::Vec3f>(row, col);
+            // Valid point: in front of the camera and within a sane depth range.
+            if (point[2] > 0 && point[2] < kMaxValidDepthMeters) {
+                std::cout << "Valid pixel at (" << col << ", " << row << ")\n";
+                std::cout << "  X = " << point[0] << " m\n";
+                std::cout << "  Y = " << point[1] << " m\n";
+                std::cout << "  Z = " << point[2] << " m\n";
+                return;
+            }
+        }
+    }
+    std::cout << "No valid 3D points found - check image loading or Q matrix\n";
+}
+
+}  // namespace
+
+int main() {
+    const std::string sequence_dir = "/home/collin/datasets/kitti/sequences/00";
+
+    const StereoCalibration calib = loadCalibration(sequence_dir + "/calib.txt");
+    std::cout << "Parsed calibration: f=" << calib.focal_length
+              << " cx=" << calib.cx << " cy=" << calib.cy
+              << " cx_right=" << calib.cx_right << " tx=" << calib.tx << "\n";
+
+    const cv::Mat left = cv::imread(frameImagePath(sequence_dir, "image_0", 0),
+                                     cv::IMREAD_GRAYSCALE);
+    const cv::Mat right = cv::imread(frameImagePath(sequence_dir, "image_1", 0),
+                                      cv::IMREAD_GRAYSCALE);
+
+    if (left.empty() || right.empty()) {
+        std::cerr << "ERROR: Could not load images\n";
+        return -1;
+    }
+
+    const cv::Mat disparity = computeDisparity(left, right);
+    const cv::Mat points_3d = disparityToPointCloud(disparity, calib);
+    printFirstValidPoint(points_3d);
+
+    // Next steps (see project task list):
+    //   2. ORB detect/compute on left image
+    //   3. Match descriptors between frame t and frame t+1
+    //   4. Build 3D (frame t) <-> 2D (frame t+1) correspondences
+    //   5. solvePnPRansac -> incremental pose
+    //   6. Compose incremental pose into running world pose
+
+    return 0;
+}
