@@ -1,5 +1,6 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/calib3d.hpp>
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -143,6 +144,64 @@ cv::Mat disparityToPointCloud(const cv::Mat& disparity_float,
     return points_3d;
 }
 
+// Keypoints (pixel locations + orientation/scale) and their matching binary
+// descriptors, bundled together since one is meaningless without the other.
+struct OrbFeatures {
+    std::vector<cv::KeyPoint> keypoints;
+    cv::Mat descriptors;
+};
+
+// Cap on how many keypoints ORB keeps (ranked by corner strength). KITTI
+// frames are 1242x375; a few thousand keeps matching fast without starving
+// later steps (PnP) of correspondences.
+constexpr int kOrbMaxFeatures = 2000;
+
+OrbFeatures detectOrbFeatures(const cv::Mat& image) {
+    const cv::Ptr<cv::ORB> orb = cv::ORB::create(kOrbMaxFeatures);
+
+    OrbFeatures features;
+    orb->detectAndCompute(image, cv::noArray(), features.keypoints,
+                           features.descriptors);
+    return features;
+}
+
+// Matches ORB descriptors from one frame to the next. Each cv::DMatch pairs
+// a query-frame keypoint with a train-frame keypoint via their descriptors'
+// Hamming distance (lower = more similar); crossCheck rejects any pair that
+// isn't each other's mutual best match, discarding a lot of ambiguous
+// matches (e.g. repetitive textures) for free.
+std::vector<cv::DMatch> matchFeatures(const OrbFeatures& features_query,
+                                       const OrbFeatures& features_train) {
+    constexpr bool kCrossCheck = true;
+    const cv::BFMatcher matcher(cv::NORM_HAMMING, kCrossCheck);
+
+    std::vector<cv::DMatch> matches;
+    matcher.match(features_query.descriptors, features_train.descriptors,
+                   matches);
+    return matches;
+}
+
+void printMatchStats(const std::vector<cv::DMatch>& matches) {
+    if (matches.empty()) {
+        std::cout << "No matches found\n";
+        return;
+    }
+
+    float min_distance = matches[0].distance;
+    float max_distance = matches[0].distance;
+    float total_distance = 0.0f;
+    for (const cv::DMatch& match : matches) {
+        min_distance = std::min(min_distance, match.distance);
+        max_distance = std::max(max_distance, match.distance);
+        total_distance += match.distance;
+    }
+    const float avg_distance = total_distance / static_cast<float>(matches.size());
+
+    std::cout << "Matched " << matches.size() << " keypoints between frames\n";
+    std::cout << "  Hamming distance: min=" << min_distance
+              << " max=" << max_distance << " avg=" << avg_distance << "\n";
+}
+
 void printFirstValidPoint(const cv::Mat& points_3d) {
     for (int row = 0; row < points_3d.rows; ++row) {
         for (int col = 0; col < points_3d.cols; ++col) {
@@ -158,6 +217,23 @@ void printFirstValidPoint(const cv::Mat& points_3d) {
         }
     }
     std::cout << "No valid 3D points found - check image loading or Q matrix\n";
+}
+
+// Builds a viewable grayscale image from a point cloud's depth (Z) values:
+// close = bright, far = dark, invalid/no-data pixels = black.
+cv::Mat buildDepthImage(const cv::Mat& points_3d) {
+    cv::Mat depth_image(points_3d.rows, points_3d.cols, CV_8UC1, cv::Scalar(0));
+
+    for (int row = 0; row < points_3d.rows; ++row) {
+        for (int col = 0; col < points_3d.cols; ++col) {
+            const float depth = points_3d.at<cv::Vec3f>(row, col)[2];
+            if (depth > 0 && depth < kMaxValidDepthMeters) {
+                const float brightness = 255.0f * (1.0f - depth / kMaxValidDepthMeters);
+                depth_image.at<uchar>(row, col) = static_cast<uchar>(brightness);
+            }
+        }
+    }
+    return depth_image;
 }
 
 }  // namespace
@@ -184,12 +260,29 @@ int main() {
     const cv::Mat points_3d = disparityToPointCloud(disparity, calib);
     printFirstValidPoint(points_3d);
 
+    const cv::Mat depth_image = buildDepthImage(points_3d);
+    const std::string depth_image_path = "depth_frame0.png";
+    cv::imwrite(depth_image_path, depth_image);
+    std::cout << "Saved depth visualization to " << depth_image_path << "\n";
+
+    // Detect ORB features independently in the left image of two consecutive
+    // frames. Nothing is compared between them yet - that's the next step.
+    const cv::Mat left_t1 = cv::imread(frameImagePath(sequence_dir, "image_0", 1),
+                                        cv::IMREAD_GRAYSCALE);
+    const OrbFeatures features_t0 = detectOrbFeatures(left);
+    const OrbFeatures features_t1 = detectOrbFeatures(left_t1);
+    std::cout << "Frame 0: detected " << features_t0.keypoints.size()
+              << " ORB keypoints\n";
+    std::cout << "Frame 1: detected " << features_t1.keypoints.size()
+              << " ORB keypoints\n";
+
+    const std::vector<cv::DMatch> matches = matchFeatures(features_t0, features_t1);
+    printMatchStats(matches);
+
     // Next steps (see project task list):
-    //   2. ORB detect/compute on left image
-    //   3. Match descriptors between frame t and frame t+1
-    //   4. Build 3D (frame t) <-> 2D (frame t+1) correspondences
-    //   5. solvePnPRansac -> incremental pose
-    //   6. Compose incremental pose into running world pose
+    //   5. Build 3D (frame t) <-> 2D (frame t+1) correspondences
+    //   6. solvePnPRansac -> incremental pose
+    //   7. Compose incremental pose into running world pose
 
     return 0;
 }
