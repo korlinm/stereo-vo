@@ -1,0 +1,90 @@
+Step 7: Pose composition and trajectory accumulation
+
+  Objective: chain each frame-to-frame Pose from estimatePose into a running position
+  in one fixed world frame (frame 0), instead of only knowing "how much did we move
+  since last frame."
+
+  The subtlety to understand first: estimatePose's (R, t) transforms a point from frame
+  t's coordinates into frame (t+1)'s camera coordinates — i.e. X_{t+1} = R·X_t + t.
+  That's not the camera's position in the world; it's the opposite direction from what
+  you want. To accumulate a trajectory you need to invert each step before composing
+  it.
+
+  Structs/functions:
+  // Full 4x4 homogeneous transform [R t; 0 0 0 1] — the form matrix
+  // multiplication needs for composing consecutive poses.
+  cv::Mat toHomogeneous(const Pose& pose);
+
+  // Inverts a rigid-body transform. Rotation matrices are orthonormal, so
+  // R^-1 = R^T (no expensive general inverse needed); translation inverts as
+  // -R^T * t.
+  Pose invertPose(const Pose& pose);
+
+  Steps:
+  1. Initialize cv::Mat world_pose = cv::Mat::eye(4, 4, CV_64F); before any frames are
+  processed — frame 0 defines the world origin.
+  2. Implement invertPose: rotation.t() for the rotation, -rotation.t() * translation
+  for the translation.
+  3. Implement toHomogeneous: allocate a 4x4 cv::Mat, copy the 3x3 rotation into the
+  top-left block and the 3x1 translation into the top-right column (e.g. via
+  cv::Mat::copyTo on sub-matrix ROIs — look up cv::Mat::operator() with a cv::Rect),
+  leave the bottom row [0 0 0 1].
+  4. Each new frame: world_pose = world_pose *
+  toHomogeneous(invertPose(incremental_pose));
+  5. The camera's current world position is just the top-right 3x1 column of world_pose
+  after that multiply.
+  6. To get more than one step, restructure main()'s single frame-0-vs-frame-1 block
+  into a loop over i = 0 .. N-2, recomputing stereo disparity/point cloud/ORB features
+  for the new base frame each iteration.
+
+  Edge cases:
+  - buildCorrespondences needs frame i's dense point cloud, not just frame 0's — right
+  now points_3d is only computed once. The loop needs to recompute it each iteration.
+  - Long sequences can let floating-point error slowly de-orthonormalize R; not a
+  concern for a short test run.
+  - If solvePnPRansac ever fails on a low-texture frame, decide a fallback later (skip
+  / reuse last pose) — not urgent yet.
+
+  Wiring into main(): print the camera's (x, z) world position after each composed step
+  (y is mostly vertical/gravity and less useful for a top-down trajectory view).
+
+  ---
+  Step 8: Validate against KITTI ground truth
+
+  Objective: compare your accumulated trajectory against KITTI's provided ground-truth
+  poses — this is the actual "does this work" check.
+
+  poses/00.txt has one line per frame: 12 numbers = a flattened 3x4 [R|t], in the same
+  frame-0-as-origin world convention you're building in step 7.
+
+  Functions:
+  // Same flattening idea as parseCalibLine — reuse it if the format lines up.
+  std::vector<cv::Mat> loadGroundTruthPoses(const std::string& poses_path);
+
+  // Euclidean distance between your estimated and ground-truth camera position
+  // at a given frame.
+  double positionError(const cv::Mat& estimated_world_pose, const cv::Mat&
+  ground_truth_pose);
+
+  Steps:
+  1. Parse poses/00.txt the same way as calib.txt: split each line into 12 doubles,
+  reshape into 3x4 (or pad to 4x4).
+  2. For each frame where you have both an estimated and ground-truth pose, pull each
+  one's translation column and compute Euclidean distance.
+  3. Print per-frame error plus a summary (average, max) at the end of the run.
+  4. (Optional, worth doing) Dump both trajectories' (x, z) to CSV and plot with Python
+  — the classic VO "bird's-eye view vs. ground truth" sanity check.
+
+  Edge cases:
+  - You're doing stereo VO, so unlike monocular VO you already have real-world scale
+  baked into your depth via the calibrated baseline — no scale-alignment fudge factor
+  should be needed. A huge, obviously-wrong error usually means a units/convention bug,
+  not "that's just VO drift."
+  - Error should grow roughly with distance traveled (drift compounds frame to frame) —
+  a small per-distance error is a reasonable target for a first working pipeline, not
+  near-zero.
+  - Double-check KITTI's ground-truth axis convention (right-handed camera coords: X
+  right, Y down, Z forward) matches what you're accumulating — a convention mismatch
+  looks exactly like "my VO is broken" when it's actually a comparison bug.
+
+  Want to start on step 7 now, or take a pass at it yourself first?

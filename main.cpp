@@ -102,7 +102,7 @@ cv::Mat loadGrayscale(const std::string& path) {
 // StereoSGBM tuning parameters (see cv::StereoSGBM::create docs for meaning).
 constexpr int kMinDisparity = 0;
 constexpr int kNumDisparities = 96;   // must be divisible by 16
-constexpr int kBlockSize = 11;        // odd, typically 5-11
+constexpr int kBlockSize =  11;        // odd, typically 5-11
 constexpr int kDisp12MaxDiff = 1;
 constexpr int kPreFilterCap = 4;
 constexpr int kUniquenessRatio = 10;
@@ -256,6 +256,31 @@ struct PointCorrespondences {
     std::vector<cv::Point3f> object_points;
     std::vector<cv::Point2f> image_points;
 };
+// Keypoints on depth discontinuities get foreground depth bleeding into
+// background pixels (SGBM edge fattening). Reject any whose neighborhood
+// depth varies by more than this fraction of its own depth.
+constexpr int kDepthCheckRadius = 2;  // 5x5 window
+constexpr float kMaxRelativeDepthSpread = 0.1f;
+
+bool isOnDepthEdge(const cv::Mat& points_3d, int row, int col, float center_z) {
+    if (row < kDepthCheckRadius || row >= points_3d.rows - kDepthCheckRadius ||
+        col < kDepthCheckRadius || col >= points_3d.cols - kDepthCheckRadius) {
+        return true;  // can't check the window, so don't trust it
+    }
+    float min_z = center_z;
+    float max_z = center_z;
+    for (int dr = -kDepthCheckRadius; dr <= kDepthCheckRadius; ++dr) {
+        for (int dc = -kDepthCheckRadius; dc <= kDepthCheckRadius; ++dc) {
+            const float z = points_3d.at<cv::Vec3f>(row + dr, col + dc)[2];
+            if (!isValidDepth(z)) {
+                return true;  // invalid neighbor usually means an edge or occlusion
+            }
+            min_z = std::min(min_z, z);
+            max_z = std::max(max_z, z);
+        }
+    }
+    return (max_z - min_z) / center_z > kMaxRelativeDepthSpread;
+}
 
 PointCorrespondences buildCorrespondences(  const std::vector<cv::DMatch>& matches,
                                             const OrbFeatures& features_t0,
@@ -274,6 +299,10 @@ PointCorrespondences buildCorrespondences(  const std::vector<cv::DMatch>& match
 
         const cv::Vec3f point = points_3d.at<cv::Vec3f>(row, col);
         if(!isValidDepth(point[2])) {
+            continue;
+        }
+
+        if (isOnDepthEdge(points_3d, row, col, point[2])) {
             continue;
         }
 
@@ -301,6 +330,10 @@ cv::Mat buildIntrinsicMatrix(const StereoCalibration& calib){
     );
 }
 
+constexpr int kRansacIterations = 200;
+constexpr float kRansacReprojectionErrorPx = 1.5f;
+constexpr double kRansacConfidence = 0.999;
+
 // Estimates the camera's rigid-body motion from the 3D<->2D correspondences.
 // RANSAC matters here because your correspondences will contain outliers -
 // mismatched ORB features, points on moving cars, depth noise near object
@@ -317,8 +350,28 @@ std::optional<Pose> estimatePose(const PointCorrespondences& corr, const cv::Mat
         return std::nullopt;
     }
     
-    bool success = cv::solvePnPRansac(corr.object_points, corr.image_points, camera_matrix, dist_coeffs, rvec, tvec);
+    cv::Mat inliers;
+    constexpr bool kUseExtrinsicGuess = false;
+    const bool success = cv::solvePnPRansac(
+        corr.object_points, corr.image_points, camera_matrix, dist_coeffs,
+        rvec, tvec, kUseExtrinsicGuess, kRansacIterations,
+        kRansacReprojectionErrorPx, kRansacConfidence, inliers);
 
+    // std::cout << "  inliers: " << inliers.rows << " / "
+            // << corr.object_points.size() << "\n";
+    std::vector<float> inlier_depths;
+    for (int k = 0; k < inliers.rows; ++k) {
+        inlier_depths.push_back(corr.object_points[inliers.at<int>(k)].z);
+    }
+    float median_depth = 0.0f;
+    if (!inlier_depths.empty()) {
+        auto middle = inlier_depths.begin() + inlier_depths.size() / 2;
+        std::nth_element(inlier_depths.begin(), middle, inlier_depths.end());
+        median_depth = *middle;
+    }
+    std::cout << "  inliers: " << inliers.rows << " / " << corr.object_points.size()
+            << "  median depth: " << median_depth << " m\n";
+            
     if(!success) {
         return std::nullopt;
     }
@@ -463,6 +516,11 @@ double relativeTranslationError(const cv::Mat& est_prev, const cv::Mat& est_curr
     return cv::norm(error(cv::Rect(3, 0, 1, 3)));
 }
 
+// Distance traveled between two consecutive world poses.
+double stepLength(const cv::Mat& pose_prev, const cv::Mat& pose_curr) {
+    return cv::norm(pose_curr(cv::Rect(3, 0, 1, 3)) - pose_prev(cv::Rect(3, 0, 1, 3)));
+}
+
 void saveTrajectoryKitti(const std::vector<cv::Mat>& trajectory, const std::string& path) {
     std::ofstream out(path);
     out << std::setprecision(9);
@@ -478,7 +536,7 @@ void saveTrajectoryKitti(const std::vector<cv::Mat>& trajectory, const std::stri
 }  // namespace
 
 int main() {
-    constexpr int kNumFrames = 20;
+    constexpr int kNumFrames = 200;
     const std::string sequence_dir = "/home/collin/datasets/kitti/sequences/00";
 
     const StereoCalibration calib = loadCalibration(sequence_dir + "/calib.txt");
@@ -513,9 +571,18 @@ int main() {
         total_relative_error += relativeTranslationError(
             trajectory[i - 1], trajectory[i], ground_truth[i - 1], ground_truth[i]);
     }
+    
     std::cout << "Average per-frame relative translation error: "
             << total_relative_error / static_cast<double>(trajectory.size() - 1)
             << " m\n";
+
+    std::cout << "\nStep lengths (estimated vs ground truth):\n";
+    for (size_t i = 1; i < trajectory.size(); ++i) {
+        const double est_step = stepLength(trajectory[i - 1], trajectory[i]);
+        const double gt_step = stepLength(ground_truth[i - 1], ground_truth[i]);
+        std::cout << "Frame " << i << ": est=" << est_step << " m  gt=" << gt_step
+                << " m  ratio=" << est_step / gt_step << "\n";
+    }
 
     saveTrajectoryKitti(trajectory, "est_00.txt");
 
