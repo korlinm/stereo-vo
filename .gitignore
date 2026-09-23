@@ -1,3 +1,9 @@
 *.png
 test
 stereo-test
+build/
+stereo_vo
+est_*.txt
+gt_*.txt
+run.log
+*.pdf
